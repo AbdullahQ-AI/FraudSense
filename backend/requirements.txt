@@ -1,0 +1,13 @@
+﻿fastapi
+uvicorn[standard]
+onnxruntime
+torch
+scikit-learn
+pandas
+numpy
+shap
+pydantic
+python-multipart
+scipy
+
+python-dotenv

@@ -1,0 +1,17 @@
+{
+  "xgboost": {
+    "original_json_size_kb": 1700,
+    "onnx_size_kb": 863.1,
+    "size_reduction_pct": 49.2,
+    "onnx_vs_original_max_pred_diff": 1.79e-07,
+    "note": "Graph optimization gave negligible extra benefit - tree models are already compact"
+  },
+  "autoencoder": {
+    "original_size_kb": 1210.4,
+    "quantized_size_kb": 334.2,
+    "size_reduction_pct": 72.4,
+    "original_auc": 0.7395,
+    "quantized_auc": 0.7434,
+    "accuracy_impact": "negligible (+0.0039, within normal variation)"
+  }
+}
