@@ -1,8 +1,11 @@
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Depends, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from pydantic import create_model
 from typing import Optional
 import onnxruntime as ort
+import xgboost as xgb
+import shap
 import pickle
 import json
 import os
@@ -28,9 +31,9 @@ MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
 LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 LOG_FILE = os.path.join(LOGS_DIR, "predictions_log.csv")
 REFERENCE_FILE = os.path.join(MODELS_DIR, "reference_sample.csv")
-MIN_LOGS_FOR_DRIFT = 30  # need at least this many live predictions before drift check is meaningful
+MIN_LOGS_FOR_DRIFT = 30
+TOP_N_SHAP_FEATURES = 5
 
-# --- Dynamic schema construction (module load time, lightweight files only) ---
 with open(os.path.join(MODELS_DIR, "feature_cols.json"), "r") as f:
     _schema_feature_cols = json.load(f)
 
@@ -49,23 +52,29 @@ for col in _schema_feature_cols:
         _schema_fields[col] = (Optional[float], None)
 
 TransactionInput = create_model("TransactionInput", **_schema_fields)
-# --- end dynamic schema construction ---
 
-# Numeric columns are everything that isn't categorical - KS-test only applies to numeric distributions
 NUMERIC_COLS = [c for c in _schema_feature_cols if c not in CATEGORICAL_COLS]
 
 app = FastAPI(title="FraudSense API", version="1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 onnx_session = None
 label_encoders = None
 feature_cols = None
 model_metadata = None
 reference_data = None
+shap_explainer = None
 
 
 @app.on_event("startup")
 def load_models():
-    global onnx_session, label_encoders, feature_cols, model_metadata, reference_data
+    global onnx_session, label_encoders, feature_cols, model_metadata, reference_data, shap_explainer
 
     onnx_path = os.path.join(MODELS_DIR, "xgb_fraud_model.onnx")
     onnx_session = ort.InferenceSession(onnx_path)
@@ -81,16 +90,21 @@ def load_models():
 
     reference_data = pd.read_csv(REFERENCE_FILE)
 
+    xgb_booster = xgb.Booster()
+    xgb_booster.load_model(os.path.join(MODELS_DIR, "xgb_fraud_model.json"))
+    shap_explainer = shap.TreeExplainer(xgb_booster)
+
     os.makedirs(LOGS_DIR, exist_ok=True)
 
     print("Models loaded successfully.")
     print(f"   Features expected: {len(feature_cols)}")
     print(f"   Fraud threshold: {model_metadata['threshold']}")
     print(f"   Reference sample loaded: {reference_data.shape[0]} rows")
+    print("   SHAP explainer ready.")
 
 
 def log_prediction(input_dict, fraud_probability, is_fraud):
-    row = dict(input_dict)  # copy so we don't mutate the original
+    row = dict(input_dict)
     row["timestamp"] = datetime.utcnow().isoformat()
     row["fraud_probability"] = fraud_probability
     row["is_fraud"] = is_fraud
@@ -101,6 +115,23 @@ def log_prediction(input_dict, fraud_probability, is_fraud):
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+def explain_prediction(row_df):
+    shap_values = shap_explainer.shap_values(row_df)
+    contributions = shap_values[0]
+
+    feature_impacts = []
+    for feature_name, impact in zip(feature_cols, contributions):
+        feature_impacts.append({
+            "feature": feature_name,
+            "value": float(row_df.iloc[0][feature_name]),
+            "impact": round(float(impact), 5),
+            "direction": "increases_risk" if impact > 0 else "decreases_risk"
+        })
+
+    feature_impacts.sort(key=lambda x: abs(x["impact"]), reverse=True)
+    return feature_impacts[:TOP_N_SHAP_FEATURES]
 
 
 @app.get("/health")
@@ -115,40 +146,38 @@ def health_check():
 
 @app.post("/predict", dependencies=[Depends(verify_api_key)])
 def predict(transaction: TransactionInput):
-    # Convert incoming request into a single-row DataFrame, in the exact column order the model expects
     input_dict = transaction.dict()
     row = pd.DataFrame([input_dict])[feature_cols]
 
-    # Encode categorical columns using the saved LabelEncoders
     for col in CATEGORICAL_COLS:
         val = row.at[0, col]
         encoder = label_encoders[col]
         if val is None:
-            row.at[0, col] = -1  # missing category
+            row.at[0, col] = -1
         else:
             try:
                 row.at[0, col] = encoder.transform([val])[0]
             except ValueError:
-                row.at[0, col] = -1  # unseen category, not in training data
+                row.at[0, col] = -1
 
-    # Ensure all columns are numeric now (categoricals are encoded, rest are float/NaN)
     row = row.astype(np.float32)
 
-    # Run ONNX inference
     input_name = onnx_session.get_inputs()[0].name
     outputs = onnx_session.run(None, {input_name: row.values})
 
-    # outputs[1] is typically the probability array for XGBoost ONNX classifiers: [P(class 0), P(class 1)]
     fraud_probability = float(outputs[1][0][1])
     threshold = model_metadata["threshold"]
     is_fraud = fraud_probability >= threshold
+
+    top_factors = explain_prediction(row)
 
     log_prediction(input_dict, fraud_probability, is_fraud)
 
     return {
         "fraud_probability": round(fraud_probability, 4),
         "is_fraud": is_fraud,
-        "threshold_used": threshold
+        "threshold_used": threshold,
+        "top_factors": top_factors
     }
 
 
@@ -180,7 +209,7 @@ def drift_status():
         live_values = live_data[col].dropna()
 
         if len(ref_values) < 5 or len(live_values) < 5:
-            continue  # not enough points on either side to run a meaningful test
+            continue
 
         checked_count += 1
         stat, p_value = ks_2samp(ref_values, live_values)
@@ -194,7 +223,6 @@ def drift_status():
     drift_ratio = len(drifted_features) / checked_count if checked_count > 0 else 0
     overall_status = "drift_detected" if drift_ratio > 0.3 else "stable"
 
-    # Show the most significant drifted features first (lowest p-value = strongest evidence of drift)
     drifted_features.sort(key=lambda x: x["p_value"])
 
     return {
