@@ -2,7 +2,8 @@ import { useState, useEffect } from "react";
 import defaultValues from "./data/defaultValues.json";
 import { predictTransaction, getDriftStatus } from "./api";
 import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
+  RadialBarChart, RadialBar, PolarAngleAxis
 } from "recharts";
 
 const PRODUCT_OPTIONS = ["C", "H", "R", "S", "W"];
@@ -181,19 +182,39 @@ function PredictTab() {
               : "bg-green-900/30 border-green-700"
           }`}
         >
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-lg font-semibold">
-              {result.is_fraud ? "⚠️ Fraud Detected" : "✅ Transaction Looks Safe"}
-            </span>
-            <span className="text-2xl font-bold">
-              {(result.fraud_probability * 100).toFixed(1)}%
-            </span>
-          </div>
-          <div className="w-full bg-slate-700 rounded-full h-3 overflow-hidden">
-            <div
-              className={`h-3 ${result.is_fraud ? "bg-red-500" : "bg-green-500"}`}
-              style={{ width: `${result.fraud_probability * 100}%` }}
-            />
+          <div className="flex items-center gap-6 mb-3">
+            <div className="relative w-28 h-28 flex-shrink-0">
+              <ResponsiveContainer width="100%" height="100%">
+                <RadialBarChart
+                  innerRadius="70%"
+                  outerRadius="100%"
+                  data={[{ value: result.fraud_probability * 100 }]}
+                  startAngle={90}
+                  endAngle={-270}
+                >
+                  <PolarAngleAxis type="number" domain={[0, 100]} angleAxisId={0} tick={false} />
+                  <RadialBar
+                    background={{ fill: "#334155" }}
+                    dataKey="value"
+                    cornerRadius={30}
+                    fill={result.is_fraud ? "#ef4444" : "#22c55e"}
+                  />
+                </RadialBarChart>
+              </ResponsiveContainer>
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="text-xl font-bold">
+                  {(result.fraud_probability * 100).toFixed(0)}%
+                </span>
+              </div>
+            </div>
+            <div>
+              <span className="text-lg font-semibold block">
+                {result.is_fraud ? "⚠️ Fraud Detected" : "Transaction Looks Safe"}
+              </span>
+              <span className="text-sm text-slate-400">
+                Fraud probability score
+              </span>
+            </div>
           </div>
           <p className="text-sm text-slate-400 mt-2">
             Threshold used: {(result.threshold_used * 100).toFixed(0)}%
@@ -325,7 +346,7 @@ function DriftTab() {
       >
         <div className="flex items-center justify-between mb-4">
           <span className="text-lg font-semibold">
-            {isDrifted ? "⚠ Data Drift Detected" : "✅ Model Input Distribution Stable"}
+            {isDrifted ? "⚠ Data Drift Detected" : "Model Input Distribution Stable"}
           </span>
           <button
             onClick={fetchDrift}
