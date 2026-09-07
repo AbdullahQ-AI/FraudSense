@@ -196,9 +196,42 @@ function App() {
                 style={{ width: `${result.fraud_probability * 100}%` }}
               />
             </div>
-            <p className="text-sm text-slate-400 mt-2">
+                        <p className="text-sm text-slate-400 mt-2">
               Threshold used: {(result.threshold_used * 100).toFixed(0)}%
             </p>
+
+            {result.top_factors && result.top_factors.length > 0 && (
+              <div className="mt-5 pt-4 border-t border-slate-700">
+                <p className="text-sm font-semibold text-slate-300 mb-3">
+                  Top factors behind this decision
+                </p>
+                <div className="space-y-2">
+                  {result.top_factors.map((factor, idx) => {
+                    const maxAbs = Math.max(
+                      ...result.top_factors.map((f) => Math.abs(f.impact))
+                    );
+                    const widthPct = (Math.abs(factor.impact) / maxAbs) * 100;
+                    const isRisk = factor.direction === "increases_risk";
+                    return (
+                      <div key={idx} className="text-sm">
+                        <div className="flex justify-between mb-1">
+                          <span className="text-slate-300">{factor.feature}</span>
+                          <span className={isRisk ? "text-red-400" : "text-green-400"}>
+                            {isRisk ? "↑ risk" : "↓ risk"}
+                          </span>
+                        </div>
+                        <div className="w-full bg-slate-700 rounded-full h-2 overflow-hidden">
+                          <div
+                            className={`h-2 ${isRisk ? "bg-red-500" : "bg-green-500"}`}
+                            style={{ width: `${widthPct}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
