@@ -6,6 +6,8 @@ from typing import Optional
 import onnxruntime as ort
 import xgboost as xgb
 import shap
+import torch
+import torch.nn as nn
 import pickle
 import json
 import os
@@ -33,6 +35,12 @@ LOG_FILE = os.path.join(LOGS_DIR, "predictions_log.csv")
 REFERENCE_FILE = os.path.join(MODELS_DIR, "reference_sample.csv")
 MIN_LOGS_FOR_DRIFT = 30
 TOP_N_SHAP_FEATURES = 5
+
+# Approximate cutoff between genuine-transaction reconstruction error (median 0.055)
+# and fraud-transaction reconstruction error (median 0.190), observed during training.
+# This is an interim heuristic, not a formally validated threshold - flagged honestly
+# in the API response and worth calibrating further with labeled validation data.
+AUTOENCODER_ANOMALY_THRESHOLD = 0.15
 
 with open(os.path.join(MODELS_DIR, "feature_cols.json"), "r") as f:
     _schema_feature_cols = json.load(f)
@@ -64,17 +72,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class Autoencoder(nn.Module):
+    """Matches the exact layer structure of the trained autoencoder_v2 state_dict
+    (verified against saved weight shapes: 420->256->128->64->32->64->128->256->420)."""
+
+    def __init__(self, input_dim=420):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(32, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, input_dim),
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+
 onnx_session = None
 label_encoders = None
 feature_cols = None
 model_metadata = None
 reference_data = None
 shap_explainer = None
+optimization_summary = None
+robust_scaler = None
+autoencoder_model = None
 
 
 @app.on_event("startup")
 def load_models():
-    global onnx_session, label_encoders, feature_cols, model_metadata, reference_data, shap_explainer
+    global onnx_session, label_encoders, feature_cols, model_metadata, reference_data
+    global shap_explainer, optimization_summary, robust_scaler, autoencoder_model
 
     onnx_path = os.path.join(MODELS_DIR, "xgb_fraud_model.onnx")
     onnx_session = ort.InferenceSession(onnx_path)
@@ -88,11 +140,22 @@ def load_models():
     with open(os.path.join(MODELS_DIR, "model_metadata.json"), "r") as f:
         model_metadata = json.load(f)
 
+    with open(os.path.join(MODELS_DIR, "optimization_summary.json"), "r") as f:
+        optimization_summary = json.load(f)
+
+    with open(os.path.join(MODELS_DIR, "robust_scaler.pkl"), "rb") as f:
+        robust_scaler = pickle.load(f)
+
     reference_data = pd.read_csv(REFERENCE_FILE)
 
     xgb_booster = xgb.Booster()
     xgb_booster.load_model(os.path.join(MODELS_DIR, "xgb_fraud_model.json"))
     shap_explainer = shap.TreeExplainer(xgb_booster)
+
+    autoencoder_model = Autoencoder(input_dim=len(feature_cols))
+    ae_state_dict = torch.load(os.path.join(MODELS_DIR, "autoencoder_v2.pth"), map_location="cpu")
+    autoencoder_model.load_state_dict(ae_state_dict)
+    autoencoder_model.eval()
 
     os.makedirs(LOGS_DIR, exist_ok=True)
 
@@ -101,6 +164,7 @@ def load_models():
     print(f"   Fraud threshold: {model_metadata['threshold']}")
     print(f"   Reference sample loaded: {reference_data.shape[0]} rows")
     print("   SHAP explainer ready.")
+    print("   Autoencoder (anomaly detector) ready.")
 
 
 def log_prediction(input_dict, fraud_probability, is_fraud):
@@ -134,6 +198,28 @@ def explain_prediction(row_df):
     return feature_impacts[:TOP_N_SHAP_FEATURES]
 
 
+def compute_anomaly_score(row_df):
+    """Runs the transaction through the autoencoder and returns its reconstruction error.
+    A high error means this transaction's overall pattern looks statistically unusual
+    compared to what the autoencoder learned from typical transactions - a complementary
+    signal to XGBoost's direct fraud classification, useful for catching novel patterns
+    XGBoost was never trained to recognize as fraud."""
+    ae_input = row_df.fillna(-999).values.astype(np.float32)
+    ae_scaled = robust_scaler.transform(ae_input)
+    ae_scaled = np.clip(ae_scaled, -10, 10).astype(np.float32)
+
+    with torch.no_grad():
+        input_tensor = torch.tensor(ae_scaled, dtype=torch.float32)
+        reconstruction = autoencoder_model(input_tensor)
+        recon_error = torch.mean((input_tensor - reconstruction) ** 2).item()
+
+    return {
+        "anomaly_score": round(recon_error, 4),
+        "anomaly_flag": "unusual_pattern" if recon_error > AUTOENCODER_ANOMALY_THRESHOLD else "typical_pattern",
+        "note": "Interim heuristic threshold (0.15) based on training-time median separation; not yet formally validated."
+    }
+
+
 @app.get("/health")
 def health_check():
     return {
@@ -141,6 +227,29 @@ def health_check():
         "model_loaded": onnx_session is not None,
         "num_features": len(feature_cols) if feature_cols else 0,
         "threshold": model_metadata["threshold"] if model_metadata else None
+    }
+
+
+@app.get("/model-info", dependencies=[Depends(verify_api_key)])
+def model_info():
+    return {
+        "xgboost": {
+            "roc_auc": model_metadata.get("roc_auc"),
+            "precision": model_metadata.get("precision"),
+            "recall": model_metadata.get("recall"),
+            "f1_score": model_metadata.get("f1_score"),
+            "num_features": model_metadata.get("num_features"),
+            "model_size_kb": optimization_summary["xgboost"]["onnx_size_kb"],
+            "size_reduction_pct": optimization_summary["xgboost"]["size_reduction_pct"]
+        },
+        "autoencoder": {
+            "original_auc": optimization_summary["autoencoder"]["original_auc"],
+            "quantized_auc": optimization_summary["autoencoder"]["quantized_auc"],
+            "original_size_kb": optimization_summary["autoencoder"]["original_size_kb"],
+            "quantized_size_kb": optimization_summary["autoencoder"]["quantized_size_kb"],
+            "size_reduction_pct": optimization_summary["autoencoder"]["size_reduction_pct"],
+            "role": "Unsupervised anomaly detector - flags statistically unusual transactions that the supervised XGBoost model might not directly classify as fraud."
+        }
     }
 
 
@@ -170,6 +279,7 @@ def predict(transaction: TransactionInput):
     is_fraud = fraud_probability >= threshold
 
     top_factors = explain_prediction(row)
+    anomaly_result = compute_anomaly_score(row)
 
     log_prediction(input_dict, fraud_probability, is_fraud)
 
@@ -177,7 +287,8 @@ def predict(transaction: TransactionInput):
         "fraud_probability": round(fraud_probability, 4),
         "is_fraud": is_fraud,
         "threshold_used": threshold,
-        "top_factors": top_factors
+        "top_factors": top_factors,
+        "anomaly_detection": anomaly_result
     }
 
 
