@@ -196,7 +196,7 @@ function App() {
                 style={{ width: `${result.fraud_probability * 100}%` }}
               />
             </div>
-                        <p className="text-sm text-slate-400 mt-2">
+            <p className="text-sm text-slate-400 mt-2">
               Threshold used: {(result.threshold_used * 100).toFixed(0)}%
             </p>
 
@@ -230,6 +230,30 @@ function App() {
                     );
                   })}
                 </div>
+              </div>
+            )}
+
+            {result.anomaly_detection && (
+              <div className="mt-4 pt-4 border-t border-slate-700">
+                <div className="flex justify-between items-center">
+                  <span className="text-sm font-semibold text-slate-300">
+                    Anomaly Detection (Autoencoder)
+                  </span>
+                  <span
+                    className={`text-xs px-2 py-1 rounded-full ${
+                      result.anomaly_detection.anomaly_flag === "unusual_pattern"
+                        ? "bg-orange-900/50 text-orange-300"
+                        : "bg-blue-900/50 text-blue-300"
+                    }`}
+                  >
+                    {result.anomaly_detection.anomaly_flag === "unusual_pattern"
+                      ? "⚠ Unusual Pattern"
+                      : "✓ Typical Pattern"}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">
+                  Reconstruction score: {result.anomaly_detection.anomaly_score}
+                </p>
               </div>
             )}
           </div>

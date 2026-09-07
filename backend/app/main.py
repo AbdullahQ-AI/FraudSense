@@ -204,7 +204,7 @@ def compute_anomaly_score(row_df):
     compared to what the autoencoder learned from typical transactions - a complementary
     signal to XGBoost's direct fraud classification, useful for catching novel patterns
     XGBoost was never trained to recognize as fraud."""
-    ae_input = row_df.fillna(-999).values.astype(np.float32)
+    ae_input = row_df.fillna(-999)
     ae_scaled = robust_scaler.transform(ae_input)
     ae_scaled = np.clip(ae_scaled, -10, 10).astype(np.float32)
 
