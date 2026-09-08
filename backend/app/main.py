@@ -344,3 +344,50 @@ def drift_status():
         "drift_ratio": round(drift_ratio, 3),
         "top_drifted_features": drifted_features[:10]
     }
+@app.get("/transactions", dependencies=[Depends(verify_api_key)])
+def get_transactions(limit: int = 50):
+    if not os.path.isfile(LOG_FILE):
+        return {"transactions": []}
+
+    df = pd.read_csv(LOG_FILE)
+    df = df.sort_values("timestamp", ascending=False).head(limit)
+
+    display_cols = ["timestamp", "TransactionAmt", "ProductCD", "card4", "card6",
+                     "DeviceType", "fraud_probability", "is_fraud"]
+    display_cols = [c for c in display_cols if c in df.columns]
+
+    records = df[display_cols].to_dict(orient="records")
+    for row in records:
+        for key, value in row.items():
+            if isinstance(value, float) and np.isnan(value):
+                row[key] = None
+
+    return {"transactions": records}
+
+
+@app.get("/stats", dependencies=[Depends(verify_api_key)])
+def get_stats():
+    if not os.path.isfile(LOG_FILE):
+        return {"total_transactions": 0, "total_flagged": 0, "fraud_rate": 0, "daily_trend": []}
+
+    df = pd.read_csv(LOG_FILE)
+    total = len(df)
+
+    is_fraud_bool = df["is_fraud"].astype(str).str.strip().str.lower() == "true"
+    flagged = int(is_fraud_bool.sum())
+    fraud_rate = round(flagged / total, 4) if total > 0 else 0
+
+    df["date"] = pd.to_datetime(df["timestamp"]).dt.date.astype(str)
+    df["is_fraud_bool"] = is_fraud_bool
+    daily = df.groupby("date").agg(
+        count=("timestamp", "count"),
+        flagged=("is_fraud_bool", "sum")
+    ).reset_index()
+    daily["flagged"] = daily["flagged"].astype(int)
+
+    return {
+        "total_transactions": total,
+        "total_flagged": flagged,
+        "fraud_rate": fraud_rate,
+        "daily_trend": daily.to_dict(orient="records")
+    }
