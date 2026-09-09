@@ -10,5 +10,8 @@ const api = axios.create({
 export const predictTransaction = (payload) => api.post("/predict", payload);
 export const getDriftStatus = () => api.get("/drift-status");
 export const getHealth = () => api.get("/health");
+export const getModelInfo = () => api.get("/model-info");
+export const getTransactions = (limit = 50) => api.get(`/transactions?limit=${limit}`);
+export const getStats = () => api.get("/stats");
 
 export default api;

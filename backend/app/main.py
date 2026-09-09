@@ -36,10 +36,6 @@ REFERENCE_FILE = os.path.join(MODELS_DIR, "reference_sample.csv")
 MIN_LOGS_FOR_DRIFT = 30
 TOP_N_SHAP_FEATURES = 5
 
-# Approximate cutoff between genuine-transaction reconstruction error (median 0.055)
-# and fraud-transaction reconstruction error (median 0.190), observed during training.
-# This is an interim heuristic, not a formally validated threshold - flagged honestly
-# in the API response and worth calibrating further with labeled validation data.
 AUTOENCODER_ANOMALY_THRESHOLD = 0.15
 
 with open(os.path.join(MODELS_DIR, "feature_cols.json"), "r") as f:
@@ -187,9 +183,11 @@ def explain_prediction(row_df):
 
     feature_impacts = []
     for feature_name, impact in zip(feature_cols, contributions):
+        raw_val = row_df.iloc[0][feature_name]
+        clean_val = None if pd.isna(raw_val) else float(raw_val)
         feature_impacts.append({
             "feature": feature_name,
-            "value": float(row_df.iloc[0][feature_name]),
+            "value": clean_val,
             "impact": round(float(impact), 5),
             "direction": "increases_risk" if impact > 0 else "decreases_risk"
         })
@@ -344,6 +342,8 @@ def drift_status():
         "drift_ratio": round(drift_ratio, 3),
         "top_drifted_features": drifted_features[:10]
     }
+
+
 @app.get("/transactions", dependencies=[Depends(verify_api_key)])
 def get_transactions(limit: int = 50):
     if not os.path.isfile(LOG_FILE):
